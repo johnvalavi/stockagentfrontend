@@ -21,7 +21,7 @@ import os  # For environment variables
 from datetime import datetime  # For date handling
 
 # External libraries
-from openai import OpenAI  # OpenAI API client
+import google.generativeai as genai  # Google Generative AI client
 from dotenv import load_dotenv  # Load environment variables from .env file
 import yfinance as yf  # Yahoo Finance API for stock data
 import numpy as np  # Numerical computations
@@ -223,12 +223,26 @@ class StockAnalysisFlow(Flow):
             )
             await asyncio.sleep(0)  # Allow other tasks to run
             
-            # Step 2.3: Call OpenAI to analyze user input and extract investment data
-            model = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            response = model.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages= self.state['state']['messages'],
-                tools= [extract_relevant_data_from_user_prompt]  # Function calling tool
+            # Step 2.3: Call Gemini to analyze user input and extract investment data
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash-exp",
+                tools=[extract_relevant_data_from_user_prompt]
+            )
+
+            # Convert messages to Gemini format
+            gemini_messages = []
+            for msg in self.state['state']['messages']:
+                if msg.role == "user":
+                    gemini_messages.append({"role": "user", "parts": [msg.content]})
+                elif msg.role == "assistant":
+                    gemini_messages.append({"role": "model", "parts": [msg.content]})
+
+            response = model.generate_content(
+                gemini_messages,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                )
             )
             
             # Step 2.4: Update tool log status to completed
@@ -247,24 +261,35 @@ class StockAnalysisFlow(Flow):
             )
             await asyncio.sleep(0)
             
-            # Step 2.5: Check if OpenAI extracted structured data via function calling
-            if(response.choices[0].finish_reason == "tool_calls"):
-                # Convert tool calls to our internal format
-                tool_calls = [
-                    convert_tool_call(tc)
-                    for tc in response.choices[0].message.tool_calls
-                ]
+            # Step 2.5: Check if Gemini extracted structured data via function calling
+            if response.candidates and response.candidates[0].function_calls:
+                # Convert function calls to our internal format
+                tool_calls = []
+                for fc in response.candidates[0].function_calls:
+                    tool_calls.append({
+                        "id": str(uuid.uuid4()),
+                        "type": "function",
+                        "function": {
+                            "name": fc.name,
+                            "arguments": json.dumps(fc.args),
+                        },
+                    })
+
                 # Create assistant message with tool calls
                 a_message = AssistantMessage(
-                    role="assistant", tool_calls=tool_calls, id=response.id
+                    role="assistant", tool_calls=tool_calls, id=str(uuid.uuid4())
                 )
                 self.state['state']["messages"].append(a_message)
                 return "simulation"  # Proceed to data gathering step
             else:
                 # No structured data extracted, just respond with regular message
+                content = ""
+                if response.candidates and response.candidates[0].content.parts:
+                    content = response.candidates[0].content.parts[0].text
+
                 a_message = AssistantMessage(
-                    id=response.id,
-                    content=response.choices[0].message.content,
+                    id=str(uuid.uuid4()),
+                    content=content,
                     role="assistant",
                 )
                 self.state['state']["messages"].append(a_message)
@@ -274,7 +299,7 @@ class StockAnalysisFlow(Flow):
         except Exception as e:
             # Step 2.6: Handle any errors during processing
             print(e)
-            a_message = AssistantMessage(id=response.id, content="", role="assistant")
+            a_message = AssistantMessage(id=str(uuid.uuid4()), content="", role="assistant")
             self.state['state']["messages"].append(a_message)
             return "end"
     
@@ -813,26 +838,34 @@ class StockAnalysisFlow(Flow):
         # Step 5.4: Extract ticker symbols for insights analysis
         tickers = self.be_arguments['ticker_symbols']
         
-        # Step 5.5: Call OpenAI to generate bull/bear insights
-        model = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = model.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": insights_prompt},  # Custom insights prompt
-                {"role": "user", "content": json.dumps(tickers)},  # Send ticker list
-            ],
-            tools=[generate_insights],  # Use insights generation tool
+        # Step 5.5: Call Gemini to generate bull/bear insights
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash-exp",
+            tools=[generate_insights]
         )
-        
+
+        response = model.generate_content(
+            [
+                {"role": "user", "parts": [insights_prompt + "\n\nTickers: " + json.dumps(tickers)]}
+            ],
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3,
+            )
+        )
+
         # Step 5.6: Process the insights response
-        if response.choices[0].finish_reason == "tool_calls":
+        if response.candidates and response.candidates[0].function_calls:
             # Step 5.6.1: Extract existing arguments from chart rendering tool call
             args_dict = json.loads(self.state['state']["messages"][-1].tool_calls[0].function.arguments)
 
             # Step 5.6.2: Add the generated insights to the arguments
-            args_dict["insights"] = json.loads(
-                response.choices[0].message.tool_calls[0].function.arguments
-            )
+            insights_data = {}
+            for fc in response.candidates[0].function_calls:
+                if fc.name == "generate_insights":
+                    insights_data = fc.args
+
+            args_dict["insights"] = insights_data
 
             # Step 5.6.3: Update the tool call arguments with insights included
             self.state['state']["messages"][-1].tool_calls[0].function.arguments = json.dumps(args_dict)
